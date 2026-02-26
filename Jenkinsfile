@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     parameters {
-        string(name: 'BACKEND_COUNT', defaultValue: '2', description: 'Number of backend containers')
+        choice(name: 'BACKEND_COUNT', choices: ['1', '2'], description: 'Number of backend containers')
     }
 
     stages {
@@ -19,13 +19,20 @@ pipeline {
         stage('Deploy Backend Containers') {
             steps {
                 script {
-                    int count = params.BACKEND_COUNT.toInteger()
+                    sh '''
+                    docker network create app-network || true
+                    docker rm -f backend1 backend2 || true
+                    '''
 
-                    sh 'docker network create app-network || true'
-
-                    for (int i = 1; i <= count; i++) {
-                        sh "docker rm -f backend${i} || true"
-                        sh "docker run -d --name backend${i} --network app-network backend-app"
+                    if (params.BACKEND_COUNT == '1') {
+                        sh '''
+                        docker run -d --name backend1 --network app-network backend-app
+                        '''
+                    } else {
+                        sh '''
+                        docker run -d --name backend1 --network app-network backend-app
+                        docker run -d --name backend2 --network app-network backend-app
+                        '''
                     }
                 }
             }
@@ -33,18 +40,56 @@ pipeline {
 
         stage('Deploy NGINX Load Balancer') {
             steps {
-                sh '''
-                docker rm -f nginx-lb || true
+                script {
+                    sh '''
+                    docker rm -f nginx-lb || true
+                    docker run -d --name nginx-lb --network app-network -p 80:80 nginx
+                    '''
 
-                docker run -d \
-                  --name nginx-lb \
-                  --network app-network \
-                  -p 80:80 nginx
+                    if (params.BACKEND_COUNT == '1') {
+                        writeFile file: 'nginx.conf', text: '''
+                        upstream backend {
+                            server backend1:8080;
+                        }
 
-                docker cp nginx/default.conf nginx-lb:/etc/nginx/conf.d/default.conf
-                docker exec nginx-lb nginx -s reload
-                '''
+                        server {
+                            listen 80;
+                            location / {
+                                proxy_pass http://backend;
+                            }
+                        }
+                        '''
+                    } else {
+                        writeFile file: 'nginx.conf', text: '''
+                        upstream backend {
+                            server backend1:8080;
+                            server backend2:8080;
+                        }
+
+                        server {
+                            listen 80;
+                            location / {
+                                proxy_pass http://backend;
+                            }
+                        }
+                        '''
+                    }
+
+                    sh '''
+                    docker cp nginx.conf nginx-lb:/etc/nginx/conf.d/default.conf
+                    docker exec nginx-lb nginx -s reload
+                    '''
+                }
             }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Pipeline executed successfully. Load balancing working!'
+        }
+        failure {
+            echo '❌ Pipeline failed. Check logs.'
         }
     }
 }
